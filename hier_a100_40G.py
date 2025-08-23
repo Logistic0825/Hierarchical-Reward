@@ -240,6 +240,8 @@ class HierarchicalMixGRPO:
         self.mid_steps = list(range(15, 35))
         self.late_steps = list(range(35, 50))
         self.optimizer = optim.AdamW(self.pipe.unet.parameters(), lr=1e-5)
+        # 🔴 添加一个用于奖励计算的简化推理步数
+        self.reward_inference_steps = 10
 
     def get_timestep_reward_weights(self, timestep):
         if timestep in self.early_steps:
@@ -252,132 +254,129 @@ class HierarchicalMixGRPO:
     def compute_hierarchical_reward(self, images, texts, timesteps):
         batch_size = len(images)
         total_rewards = torch.zeros(batch_size).to(images.device)
-
+        
+        # 🔴 修复：将图像从 PyTorch tensor 转换为 PIL 图像列表
         pil_images = []
-        for img in images:
-            if isinstance(img, torch.Tensor):
-                img_normalized = (img + 1.0) / 2.0
-                img_normalized = torch.clamp(img_normalized, 0, 1)
-                img_pil = transforms.ToPILImage()(img_normalized.cpu())
-                pil_images.append(img_pil)
-            else: # PIL Image
-                pil_images.append(img)
+        for img_tensor in images:
+            # 去标准化并转换
+            img_normalized = (img_tensor + 1.0) / 2.0
+            img_normalized = torch.clamp(img_normalized, 0, 1)
+            pil_image = transforms.ToPILImage()(img_normalized.cpu())
+            pil_images.append(pil_image)
+
         semantic_rewards = self.reward_model.semantic_consistency_reward(pil_images, texts)
-        structure_rewards = self.reward_model.structure_reward(pil_images)
         aesthetic_rewards = self.reward_model.aesthetic_reward(pil_images)
+        # 注意：这里结构奖励通常需要更复杂的逻辑，但目前先使用 Aesthetic 头部
+        structure_rewards = self.reward_model.structure_reward(pil_images)
+
+        # 确保奖励张量的维度正确
         if semantic_rewards.dim() == 0:
             semantic_rewards = semantic_rewards.unsqueeze(0).expand(batch_size)
-        if structure_rewards.dim() == 0:
-            structure_rewards = structure_rewards.unsqueeze(0).expand(batch_size)
         if aesthetic_rewards.dim() == 0:
             aesthetic_rewards = aesthetic_rewards.unsqueeze(0).expand(batch_size)
-        for i, timestep in enumerate(timesteps):
-            weights = self.get_timestep_reward_weights(timestep.item())
-            sem_reward = semantic_rewards[i] if i < len(semantic_rewards) else semantic_rewards[0]
-            str_reward = structure_rewards[i] if i < len(structure_rewards) else structure_rewards[0]
-            aes_reward = aesthetic_rewards[i] if i < len(aesthetic_rewards) else aesthetic_rewards[0]
-            combined_reward = (
-                weights['semantic'] * sem_reward +
-                weights['structure'] * str_reward +
-                weights['aesthetic'] * aes_reward
-            )
-            total_rewards[i] = combined_reward
-
-        return total_rewards
+        if structure_rewards.dim() == 0:
+            structure_rewards = structure_rewards.unsqueeze(0).expand(batch_size)
+            
+        # 修正：由于我们是在一个完整生成图像上计算的奖励，timestep 权重应该针对整个批次是固定的
+        # 或者更精确地，我们可以根据训练开始的原始 timestep 来计算权重
+        # 为了简单起见，我们假设所有图像都来自同一个阶段
+        
+        # 🔴 修复：将奖励组件也作为返回值
+        return total_rewards, semantic_rewards, aesthetic_rewards
 
     def train_step(self, batch):
-      images = batch['image']
-      texts = batch['text']
-      self.pipe.unet.train()
-      self.optimizer.zero_grad()
+        images = batch['image']
+        texts = batch['text']
+        self.pipe.unet.train()
+        self.optimizer.zero_grad()
 
-      # 🔴 FIX: Initialize latents before the loop
-      with torch.no_grad():
-          latents = self.pipe.vae.encode(images).latent_dist.sample()
-          latents = latents * self.pipe.vae.config.scaling_factor
+        batch_size = images.shape[0]
 
-      # We will compute rewards for each sample individually in the batch.
-      batch_size = images.shape[0]
-      total_rewards = torch.zeros(batch_size, device=self.device)
-      all_denoised_images = []
-      
-      # 🔴 Fix: Set timesteps once for the whole loop
-      self.pipe.scheduler.set_timesteps(self.pipe.scheduler.num_train_timesteps)
+        # 🔴 改进1: 随机选择一个初始噪声时间步
+        initial_timestep = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (1,), device=self.device)
+        
+        # 🔴 改进2: 生成图像用于奖励计算
+        with torch.no_grad():
+            # 为奖励计算运行一个简化的推理循环
+            generated_images = self.pipe(
+                prompt=texts,
+                num_inference_steps=self.reward_inference_steps,
+                output_type="pil",
+            ).images
+            
+            # 将PIL图像列表转换为Tensor，因为奖励模型需要它
+            reward_images_tensors = [transforms.ToTensor()(img).to(self.device) for img in generated_images]
+            reward_images_tensors = torch.stack(reward_images_tensors)
+            
+            # 计算奖励
+            semantic_rewards = self.reward_model.semantic_consistency_reward(generated_images, texts)
+            aesthetic_rewards = self.reward_model.aesthetic_reward(generated_images)
+            # 结构奖励在这里先用aesthetic替代，或者你有自己的模型
+            structure_rewards = self.reward_model.structure_reward(generated_images)
+            
+            # 🔴 计算总奖励，使用一个固定的阶段权重（例如，中期）
+            # 因为整个批次都是在同一个训练步骤生成的，我们选择一个代表性的阶段来应用权重
+            weights = self.get_timestep_reward_weights(initial_timestep.item())
+            total_rewards = (
+                weights['semantic'] * semantic_rewards +
+                weights['structure'] * structure_rewards +
+                weights['aesthetic'] * aesthetic_rewards
+            )
 
-      for i in range(batch_size):
-          # Prepare data for a single sample from the batch
-          # latent is now defined outside the loop
-          
-          timestep = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (1,), device=self.device)
-          noise = torch.randn_like(latents[i:i+1])
-          noisy_latent = self.pipe.scheduler.add_noise(latents[i:i+1], noise, timestep)
-          
-          text_inputs = self.pipe.tokenizer(texts[i], padding=True, truncation=True, return_tensors="pt", max_length=self.pipe.tokenizer.model_max_length)
-          text_embeddings = self.pipe.text_encoder(text_inputs.input_ids.to(self.device))[0]
+        # 🔴 改进3: 正常执行一步训练
+        # 这次使用原始图像和噪声，而不是生成的图像
+        latents = self.pipe.vae.encode(images).latent_dist.sample() * self.pipe.vae.config.scaling_factor
+        
+        # 🔴 Fix: 使用随机时间步来训练UNet
+        timesteps_full_batch = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (batch_size,), device=self.device)
+        noise_full_batch = torch.randn_like(latents)
+        noisy_latents_full_batch = self.pipe.scheduler.add_noise(latents, noise_full_batch, timesteps_full_batch)
+        
+        text_inputs_full_batch = self.pipe.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+        text_embeddings_full_batch = self.pipe.text_encoder(text_inputs_full_batch.input_ids.to(self.device))[0]
+        
+        noise_pred_full_batch = self.pipe.unet(noisy_latents_full_batch, timesteps_full_batch, text_embeddings_full_batch).sample
 
-          noise_pred = self.pipe.unet(noisy_latent, timestep, text_embeddings).sample
-          
-          with torch.no_grad():
-              scheduler_output = self.pipe.scheduler.step(model_output=noise_pred, timestep=timestep, sample=noisy_latent)
-              denoised_latent = scheduler_output.prev_sample
+        # 计算策略损失
+        mse_loss = nn.functional.mse_loss(noise_pred_full_batch, noise_full_batch, reduction='none').mean(dim=[1, 2, 3])
+        policy_loss = (mse_loss * (1 - total_rewards)).mean()
 
-              denoised_image = self.pipe.vae.decode(denoised_latent / self.pipe.vae.config.scaling_factor).sample
-              all_denoised_images.append(denoised_image)
+        # 反向传播
+        policy_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.pipe.unet.parameters(), 1.0)
+        self.optimizer.step()
 
-          # Compute reward for the single image
-          reward = self.compute_hierarchical_reward(denoised_image, [texts[i]], timestep)
-          total_rewards[i] = reward.squeeze() # Squeeze to ensure it's a scalar tensor
-      
-      # After the loop, stack the results and compute the loss
-      # Re-run the UNet on the batch to get the noise prediction for loss calculation
-      timesteps_full_batch = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (batch_size,), device=self.device)
-      # 🔴 FIX: Use torch.randn_like(latents)
-      noise_full_batch = torch.randn_like(latents) 
-      noisy_latents_full_batch = self.pipe.scheduler.add_noise(latents, noise_full_batch, timesteps_full_batch)
-      text_inputs_full_batch = self.pipe.tokenizer(texts, padding=True, truncation=True, return_tensors="pt", max_length=self.pipe.tokenizer.model_max_length)
-      text_embeddings_full_batch = self.pipe.text_encoder(text_inputs_full_batch.input_ids.to(self.device))[0]
-      
-      noise_pred_full_batch = self.pipe.unet(noisy_latents_full_batch, timesteps_full_batch, text_embeddings_full_batch).sample
-      
-      mse_loss = nn.functional.mse_loss(noise_pred_full_batch, noise_full_batch, reduction='none').mean(dim=[1, 2, 3])
+        return {
+            'policy_loss': policy_loss.item(),
+            'avg_reward': total_rewards.mean().item(),
+            'semantic_reward': semantic_rewards.mean().item(),
+            'aesthetic_reward': aesthetic_rewards.mean().item(),
+        }
 
-      if total_rewards.shape != mse_loss.shape:
-          total_rewards = total_rewards.reshape(mse_loss.shape)
-
-      policy_loss = (mse_loss * (1 - total_rewards)).mean()
-      
-      policy_loss.backward()
-      torch.nn.utils.clip_grad_norm_(self.pipe.unet.parameters(), 1.0)
-      self.optimizer.step()
-          
-      return {
-          'policy_loss': policy_loss.item(),
-          'avg_reward': total_rewards.mean().item(),
-          'semantic_reward': 0.0,
-          'aesthetic_reward': 0.0
-      }
-
+    # 其他函数保持不变 ...
     def generate_images_with_intermediate_steps(self, text_prompt, num_inference_steps=50, save_dir="intermediate_generation"):
         os.makedirs(save_dir, exist_ok=True)
         print(f"\nGenerating image for prompt: '{text_prompt}'")
         generator = torch.Generator(self.device).manual_seed(42)
-        
+
         latents = torch.randn((1, self.pipe.unet.config.in_channels, 64, 64), device=self.device, generator=generator)
         self.pipe.scheduler.set_timesteps(num_inference_steps)
-        
+
         for i, t in enumerate(self.pipe.scheduler.timesteps):
             with torch.no_grad():
-                noise_pred = self.pipe.unet(latents, t, self.pipe.text_encoder(self.pipe.tokenizer(text_prompt, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(self.device))[0]).sample
-            
+                text_inputs = self.pipe.tokenizer(text_prompt, padding="max_length", truncation=True, return_tensors="pt")
+                text_embeddings = self.pipe.text_encoder(text_inputs.input_ids.to(self.device))[0]
+                noise_pred = self.pipe.unet(latents, t, text_embeddings).sample
+
             latents = self.pipe.scheduler.step(noise_pred, t, latents).prev_sample
-            
+
             if (i+1) % 5 == 0 or i == 0 or i == num_inference_steps - 1:
                 with torch.no_grad():
                     image = self.pipe.vae.decode(latents / self.pipe.vae.config.scaling_factor).sample
                     image = (image / 2 + 0.5).clamp(0, 1)
                     image = image.cpu().permute(0, 2, 3, 1).numpy()[0]
                     image = Image.fromarray((image * 255).astype(np.uint8))
-                    
+
                     filename = os.path.join(save_dir, f"step_{i+1:03d}.png")
                     image.save(filename)
                     print(f"  - Saved image at step {i+1} to {filename}")
@@ -400,7 +399,7 @@ def run_hierarchical_experiment():
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, collate_fn=custom_collate_fn)
 
     print("Starting training...")
-    num_epochs = 10 
+    num_epochs = 10
     training_logs = []
     for epoch in range(num_epochs):
         epoch_logs = []
@@ -410,7 +409,7 @@ def run_hierarchical_experiment():
             epoch_logs.append(log)
             if batch_idx % 2 == 0:
                 print(f"Batch {batch_idx}: Loss={log['policy_loss']:.4f}, "
-                      f"Reward={log['avg_reward']:.4f}")
+                      f"Reward={log['avg_reward']:.4f}, Semantic={log['semantic_reward']:.4f}, Aesthetic={log['aesthetic_reward']:.4f}")
         training_logs.extend(epoch_logs)
         if epoch_logs:
             avg_loss = np.mean([log['policy_loss'] for log in epoch_logs])
@@ -427,7 +426,7 @@ def run_hierarchical_experiment():
     ]
     eval_dir = "evaluation_samples"
     os.makedirs(eval_dir, exist_ok=True)
-    
+
     for i, prompt in enumerate(test_prompts):
         image = pipe(prompt).images[0]
         image_path = os.path.join(eval_dir, f"generated_sample_{i+1}.png")
@@ -435,7 +434,7 @@ def run_hierarchical_experiment():
         with open(os.path.join(eval_dir, f"prompt_{i+1}.txt"), "w") as f:
             f.write(prompt)
         print(f"Generated and saved image for prompt: '{prompt}' to {image_path}")
-    
+
     hierarchical_grpo.generate_images_with_intermediate_steps(test_prompts[0])
 
     if training_logs:
@@ -472,10 +471,10 @@ def run_hierarchical_experiment():
 def early_validation_experiment():
     print("Running early validation experiment...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     reward_model = UnifiedRewardModel().to(device)
     test_dataset = TextToImageDataset(split="train", size=5)
-    
+
     results = {
         'semantic_scores': [],
         'aesthetic_scores': [],
@@ -514,7 +513,7 @@ def early_validation_experiment():
         print(f"  Aesthetic: {aesthetic_score.item():.3f}")
         print(f"  Structure: {structure_score.item():.3f}")
         print()
-    
+
     with open('early_validation_results.json', 'w', encoding='utf-8') as f:
         json.dump({
             'semantic_scores': results['semantic_scores'],
